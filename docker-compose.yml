@@ -1,0 +1,56 @@
+version: '3.8'
+
+services:
+  postgres:
+    image: postgres:15-alpine
+    container_name: coaching_management_postgres
+    environment:
+      POSTGRES_USER: ${DB_USER:-coaching_user}
+      POSTGRES_PASSWORD: ${DB_PASSWORD:-secure_password}
+      POSTGRES_DB: ${DB_NAME:-coaching_management}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    ports:
+      - "5432:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${DB_USER:-coaching_user}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  redis:
+    image: redis:7-alpine
+    container_name: coaching_management_redis
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  bot:
+    build: .
+    container_name: coaching_management_bot
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    environment:
+      TELEGRAM_BOT_TOKEN: ${TELEGRAM_BOT_TOKEN}
+      DATABASE_URL: postgresql://${DB_USER:-coaching_user}:${DB_PASSWORD:-secure_password}@postgres:5432/${DB_NAME:-coaching_management}
+      REDIS_URL: redis://redis:6379/0
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+      ENVIRONMENT: ${ENVIRONMENT:-production}
+      SCHEDULER_TIMEZONE: ${SCHEDULER_TIMEZONE:-Asia/Tashkent}
+      AUTO_REPORT_GENERATION_TIME: ${AUTO_REPORT_GENERATION_TIME:-23:30}
+    volumes:
+      - ./logs:/app/logs
+    restart: unless-stopped
+
+volumes:
+  postgres_data:
+  redis_data:
