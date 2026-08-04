@@ -61,3 +61,7 @@ htmlcov/
 
 # Redis
 dump.rdb
+
+# Local verification artifacts
+.venv/
+scratch/

@@ -1,148 +1,126 @@
-from datetime import date, datetime
-from typing import Optional
+"""Company-wide analytics for the manager dashboard."""
+
+import calendar
+from dataclasses import dataclass
+from datetime import date
+from typing import Sequence
 
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.logger import get_logger
-from app.domain.models import AttendanceStatus
-from app.infrastructure.repositories import DailyReportRepository, CoachRepository
+from app.infrastructure.repositories import (
+    CoachRepository,
+    CompletionStats,
+    DailyReportRepository,
+    MonthlyStats,
+)
 
 logger = get_logger()
 
 
+def month_bounds(year: int, month: int) -> tuple[date, date]:
+    """First and last calendar day of a month."""
+    last_day = calendar.monthrange(year, month)[1]
+    return date(year, month, 1), date(year, month, last_day)
+
+
+@dataclass(slots=True)
+class CompanyOverview:
+    total_coaches: int
+    total_worked_hours: float
+    attendance_percentage: float
+    total_sick_days: int
+    total_absences: int
+    completion: CompletionStats
+
+
+@dataclass(slots=True)
+class Rankings:
+    most_worked_hours: list[MonthlyStats]
+    most_punctual: list[MonthlyStats]
+    most_late_arrivals: list[MonthlyStats]
+    most_uniform_violations: list[MonthlyStats]
+
+
 class StatisticsService:
-    """Service for calculating statistics."""
-
-    def __init__(self, session: AsyncSession):
+    def __init__(self, session: AsyncSession) -> None:
         self.session = session
-        self.report_repository = DailyReportRepository(session)
-        self.coach_repository = CoachRepository(session)
+        self.reports = DailyReportRepository(session)
+        self.coaches = CoachRepository(session)
 
-    async def get_company_overview(self) -> dict:
-        """Get company-wide overview statistics."""
-        all_coaches = await self.coach_repository.get_active_coaches()
-        today = date.today()
+    async def company_overview(self, year: int, month: int) -> CompanyOverview:
+        """Month-to-date figures across the whole company."""
+        start, end = month_bounds(year, month)
+        stats = await self.reports.monthly_stats_all_coaches(year, month)
+        completion = await self.reports.completion_stats(start, end)
+        total_coaches = await self.coaches.count_active()
 
-        today_reports = await self.report_repository.get_by_date(today)
+        total_hours = sum(s.worked_hours for s in stats)
+        total_sick = sum(s.sick_days for s in stats)
+        total_absences = sum(s.unexcused_absences for s in stats)
 
-        total_worked_hours = 0.0
-        total_sick_days = 0
-        total_absences = 0
-        present_count = 0
-
-        for report in today_reports:
-            total_worked_hours += float(report.worked_hours or 0)
-
-            if report.attendance == AttendanceStatus.SICK_LEAVE:
-                total_sick_days += 1
-            elif report.attendance == AttendanceStatus.UNEXCUSED_ABSENCE:
-                total_absences += 1
-            elif report.attendance == AttendanceStatus.PRESENT:
-                present_count += 1
-
-        attendance_percentage = (
-            (present_count / len(all_coaches) * 100) if all_coaches else 0
+        # Attendance is measured against days that were actually recorded, so a
+        # month in progress is not penalised for days that have not happened.
+        recorded_days = sum(s.total_days for s in stats)
+        absent_days = total_sick + total_absences + sum(
+            s.vacation_days + s.not_filled_days for s in stats
+        )
+        attendance_pct = (
+            round((recorded_days - absent_days) / recorded_days * 100, 1)
+            if recorded_days
+            else 0.0
         )
 
-        return {
-            "total_coaches": len(all_coaches),
-            "total_worked_hours": round(total_worked_hours, 2),
-            "attendance_percentage": round(attendance_percentage, 2),
-            "total_sick_days": total_sick_days,
-            "total_absences": total_absences,
-            "reports_completed": sum(1 for r in today_reports if r.is_completed),
-            "reports_total": len(today_reports),
-        }
-
-    async def get_coach_rankings(self, year: int, month: int) -> dict:
-        """Get coach rankings for a month."""
-        coaches = await self.coach_repository.get_active_coaches()
-
-        rankings = {
-            "most_worked_hours": [],
-            "most_punctual": [],
-            "most_late_arrivals": [],
-            "most_uniform_violations": [],
-        }
-
-        coach_stats = []
-
-        for coach in coaches:
-            stats = await self.report_repository.get_monthly_stats(coach.id, year, month)
-            coach_stats.append({
-                "coach": coach,
-                "stats": stats,
-            })
-
-        # Sort by worked hours
-        coach_stats_sorted = sorted(
-            coach_stats,
-            key=lambda x: x["stats"]["worked_hours"],
-            reverse=True,
+        return CompanyOverview(
+            total_coaches=total_coaches,
+            total_worked_hours=round(total_hours, 2),
+            attendance_percentage=attendance_pct,
+            total_sick_days=total_sick,
+            total_absences=total_absences,
+            completion=completion,
         )
-        rankings["most_worked_hours"] = coach_stats_sorted[:10]
 
-        # Sort by punctuality (fewest late arrivals)
-        coach_stats_sorted = sorted(
-            coach_stats,
-            key=lambda x: x["stats"]["late_arrivals"],
+    async def rankings(
+        self, year: int, month: int, limit: int = 10
+    ) -> Rankings:
+        """Leaderboards built from one grouped query, not one query per coach."""
+        stats = list(await self.reports.monthly_stats_all_coaches(year, month))
+
+        worked = sorted(stats, key=lambda s: s.worked_hours, reverse=True)
+        late_desc = sorted(stats, key=lambda s: s.total_late_minutes, reverse=True)
+        # "Most punctual" only means something for coaches who actually worked.
+        punctual = sorted(
+            [s for s in stats if s.worked_days > 0],
+            key=lambda s: (s.total_late_minutes, -s.worked_days),
         )
-        rankings["most_punctual"] = coach_stats_sorted[:10]
+        uniform = sorted(stats, key=lambda s: s.uniform_violations, reverse=True)
 
-        # Sort by late arrivals
-        coach_stats_sorted = sorted(
-            coach_stats,
-            key=lambda x: x["stats"]["late_arrivals"],
-            reverse=True,
+        return Rankings(
+            most_worked_hours=worked[:limit],
+            most_punctual=punctual[:limit],
+            most_late_arrivals=[s for s in late_desc if s.total_late_minutes > 0][:limit],
+            most_uniform_violations=[s for s in uniform if s.uniform_violations > 0][
+                :limit
+            ],
         )
-        rankings["most_late_arrivals"] = coach_stats_sorted[:10]
 
-        # Sort by uniform violations
-        coach_stats_sorted = sorted(
-            coach_stats,
-            key=lambda x: (
-                x["stats"]["days_without_upper_uniform"]
-                + x["stats"]["days_without_lower_uniform"]
-            ),
-            reverse=True,
+    async def compare_coaches(
+        self, year: int, month: int, branch_id: int | None = None
+    ) -> list[MonthlyStats]:
+        """All coaches' month figures side by side, ordered by hours worked."""
+        stats = list(
+            await self.reports.monthly_stats_all_coaches(year, month, branch_id)
         )
-        rankings["most_uniform_violations"] = coach_stats_sorted[:10]
+        return sorted(stats, key=lambda s: s.worked_hours, reverse=True)
 
-        return rankings
+    async def attendance_trend(
+        self, year: int, month: int, branch_id: int | None = None
+    ) -> list[dict[str, object]]:
+        start, end = month_bounds(year, month)
+        return await self.reports.attendance_trend(start, end, branch_id)
 
-    async def get_attendance_trends(self, year: int, month: int) -> dict:
-        """Get attendance trends for a month."""
-        from datetime import datetime
-
-        trends = {}
-        coaches = await self.coach_repository.get_active_coaches()
-
-        for day in range(1, 32):
-            try:
-                report_date = date(year, month, day)
-                reports = await self.report_repository.get_by_date(report_date)
-
-                present = sum(
-                    1 for r in reports if r.attendance == AttendanceStatus.PRESENT
-                )
-                sick = sum(
-                    1 for r in reports if r.attendance == AttendanceStatus.SICK_LEAVE
-                )
-                vacation = sum(
-                    1 for r in reports if r.attendance == AttendanceStatus.VACATION
-                )
-                absent = sum(
-                    1 for r in reports
-                    if r.attendance == AttendanceStatus.UNEXCUSED_ABSENCE
-                )
-
-                trends[str(day)] = {
-                    "present": present,
-                    "sick": sick,
-                    "vacation": vacation,
-                    "absent": absent,
-                }
-            except ValueError:
-                break
-
-        return trends
+    async def completion(
+        self, year: int, month: int, branch_id: int | None = None
+    ) -> CompletionStats:
+        start, end = month_bounds(year, month)
+        return await self.reports.completion_stats(start, end, branch_id)

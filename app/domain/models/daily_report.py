@@ -3,7 +3,8 @@ from datetime import date, time
 from typing import TYPE_CHECKING
 
 from sqlalchemy import (
-    Date, Time, Integer, ForeignKey, String, Boolean, Text, Numeric, Enum
+    Date, Time, Integer, ForeignKey, String, Boolean, Text, Numeric, Enum,
+    UniqueConstraint, Index,
 )
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
@@ -37,8 +38,18 @@ class DailyReport(Base, TimestampMixin):
 
     __tablename__ = "daily_reports"
 
+    # One report per coach per day, enforced by the database rather than by
+    # application logic - this is what makes the nightly auto-create idempotent.
+    __table_args__ = (
+        UniqueConstraint("coach_id", "report_date", name="uq_daily_report_coach_date"),
+        Index("ix_daily_reports_branch_date", "branch_id", "report_date"),
+        Index("ix_daily_reports_date", "report_date"),
+    )
+
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
-    coach_id: Mapped[int] = mapped_column(Integer, ForeignKey("coaches.id"), nullable=False)
+    coach_id: Mapped[int] = mapped_column(
+        Integer, ForeignKey("coaches.id", ondelete="CASCADE"), nullable=False
+    )
     branch_id: Mapped[int] = mapped_column(Integer, ForeignKey("branches.id"), nullable=False)
     report_date: Mapped[date] = mapped_column(Date, nullable=False)
 
@@ -70,7 +81,9 @@ class DailyReport(Base, TimestampMixin):
 
     # Status
     is_completed: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
-    completed_by_user_id: Mapped[int | None] = mapped_column(Integer)
+    completed_by_user_id: Mapped[int | None] = mapped_column(
+        Integer, ForeignKey("users.id", ondelete="SET NULL")
+    )
 
     coach: Mapped["Coach"] = relationship("Coach", back_populates="daily_reports")
     branch: Mapped["Branch"] = relationship("Branch")

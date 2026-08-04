@@ -1,11 +1,29 @@
-from app.presentation.telegram.handlers.start_handler import router as start_router
-from app.presentation.telegram.handlers.admin_handler import router as admin_router
-from app.presentation.telegram.handlers.manager_handler import router as manager_router
-from app.presentation.telegram.handlers.report_handler import router as report_router
+"""Router registration.
 
-__all__ = [
-    "start_router",
-    "admin_router",
-    "manager_router",
-    "report_router",
-]
+Order matters: navigation and commands are matched before the stateful flows,
+so /cancel and the Home button always work even mid-form.
+"""
+
+from aiogram import Router
+
+from app.presentation.telegram.handlers import (
+    admin_panel,
+    commands,
+    manager,
+    navigation,
+    report_flow,
+)
+
+
+def build_router() -> Router:
+    root = Router(name="root")
+    root.include_router(commands.router)
+    root.include_router(commands.manager_router)
+    root.include_router(navigation.router)
+    root.include_router(report_flow.router)
+    root.include_router(manager.router)
+    root.include_router(admin_panel.router)
+    return root
+
+
+__all__ = ["build_router"]

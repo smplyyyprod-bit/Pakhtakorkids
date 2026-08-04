@@ -1,7 +1,7 @@
 from enum import Enum as PyEnum
 from typing import TYPE_CHECKING
 
-from sqlalchemy import String, Integer, Enum, ForeignKey, Boolean
+from sqlalchemy import String, Integer, BigInteger, Enum, ForeignKey, Boolean
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from app.domain.models.base import Base, TimestampMixin
@@ -24,7 +24,10 @@ class User(Base, TimestampMixin):
     __tablename__ = "users"
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
-    telegram_id: Mapped[int] = mapped_column(Integer, unique=True, nullable=False)
+    # BigInteger: Telegram user IDs already exceed the 32-bit signed range.
+    telegram_id: Mapped[int] = mapped_column(
+        BigInteger, unique=True, index=True, nullable=False
+    )
     full_name: Mapped[str] = mapped_column(String(255), nullable=False)
     phone: Mapped[str | None] = mapped_column(String(20))
     email: Mapped[str | None] = mapped_column(String(255))

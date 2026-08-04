@@ -1,153 +1,172 @@
+"""Daily report business logic."""
+
 from datetime import date, time
-from typing import Optional
+from decimal import Decimal
+from typing import Sequence
 
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.logger import get_logger
-from app.domain.models import (
-    DailyReport,
-    AttendanceStatus,
-    UniformStatus,
-    Coach,
+from app.domain.models import Coach, DailyReport
+from app.domain.models.daily_report import AttendanceStatus, UniformStatus
+from app.infrastructure.repositories import (
+    CoachRepository,
+    CompletionStats,
+    DailyReportRepository,
+    MonthlyStats,
 )
-from app.infrastructure.repositories import DailyReportRepository, CoachRepository
+from app.infrastructure.services.audit_service import AuditService
 
 logger = get_logger()
 
+# Attendance states that mean the coach was not at work; hours are forced to
+# zero for these regardless of any times left over from an earlier edit.
+NON_WORKING_STATUSES = {
+    AttendanceStatus.SICK_LEAVE,
+    AttendanceStatus.VACATION,
+    AttendanceStatus.UNEXCUSED_ABSENCE,
+    AttendanceStatus.NOT_FILLED,
+}
+
+
+def calculate_worked_hours(start: time | None, end: time | None) -> float:
+    """Hours between two clock times, treating end < start as an overnight shift."""
+    if start is None or end is None:
+        return 0.0
+
+    start_minutes = start.hour * 60 + start.minute
+    end_minutes = end.hour * 60 + end.minute
+    if end_minutes < start_minutes:
+        end_minutes += 24 * 60
+
+    return round((end_minutes - start_minutes) / 60, 2)
+
 
 class DailyReportService:
-    """Service for daily report operations."""
-
-    def __init__(self, session: AsyncSession):
+    def __init__(self, session: AsyncSession) -> None:
         self.session = session
         self.repository = DailyReportRepository(session)
-        self.coach_repository = CoachRepository(session)
+        self.coaches = CoachRepository(session)
+        self.audit = AuditService(session)
 
-    async def create_or_update_report(
-        self,
-        coach_id: int,
-        branch_id: int,
-        report_date: date,
-        **kwargs,
-    ) -> DailyReport:
-        """Create or update a daily report."""
-        report = await self.repository.get_by_coach_and_date(coach_id, report_date)
+    # ------------------------------------------------------------- reading
 
-        if not report:
-            logger.info(f"Creating report for coach {coach_id} on {report_date}")
-            report = DailyReport(
-                coach_id=coach_id,
-                branch_id=branch_id,
-                report_date=report_date,
-            )
-            self.session.add(report)
-
-        # Update fields from kwargs
-        for key, value in kwargs.items():
-            if hasattr(report, key):
-                setattr(report, key, value)
-
-        report.is_completed = True
-        report.completed_by_user_id = kwargs.get("completed_by_user_id")
-
-        await self.session.commit()
-        await self.session.refresh(report)
-        return report
-
-    async def calculate_worked_hours(
-        self, start_time: time, end_time: time
-    ) -> float:
-        """Calculate worked hours from start and end time."""
-        if not start_time or not end_time:
-            return 0.0
-
-        start = start_time
-        end = end_time
-
-        start_minutes = start.hour * 60 + start.minute
-        end_minutes = end.hour * 60 + end.minute
-
-        if end_minutes < start_minutes:  # End time is next day
-            end_minutes += 24 * 60
-
-        worked_minutes = end_minutes - start_minutes
-        return round(worked_minutes / 60, 2)
-
-    async def get_report(
-        self, coach_id: int, report_date: date
-    ) -> Optional[DailyReport]:
-        """Get report for a coach on a date."""
+    async def get_report(self, coach_id: int, report_date: date) -> DailyReport | None:
         return await self.repository.get_by_coach_and_date(coach_id, report_date)
 
-    async def get_coach_reports(self, coach_id: int) -> list[DailyReport]:
-        """Get all reports for a coach."""
-        return await self.repository.get_by_coach(coach_id)
+    async def get_or_create(
+        self, coach: Coach, report_date: date
+    ) -> DailyReport:
+        """Fetch the day's report, creating a blank one if it is missing."""
+        report = await self.repository.get_by_coach_and_date(coach.id, report_date)
+        if report is not None:
+            return report
 
-    async def get_monthly_reports(
-        self, coach_id: int, year: int, month: int
-    ) -> list[DailyReport]:
-        """Get reports for a coach in a month."""
-        return await self.repository.get_by_coach_and_month(coach_id, year, month)
+        report = DailyReport(
+            coach_id=coach.id,
+            branch_id=coach.branch_id,
+            report_date=report_date,
+            upper_uniform=UniformStatus.NO_DATA,
+            lower_uniform=UniformStatus.NO_DATA,
+            attendance=AttendanceStatus.NOT_FILLED,
+            worked_hours=0,
+            is_completed=False,
+        )
+        await self.repository.add(report)
+        await self.session.commit()
+        return report
 
-    async def get_branch_reports(self, branch_id: int, report_date: date) -> list[DailyReport]:
-        """Get all reports for a branch on a date."""
+    async def branch_reports(
+        self, branch_id: int, report_date: date
+    ) -> Sequence[DailyReport]:
         return await self.repository.get_by_branch_and_date(branch_id, report_date)
 
-    async def auto_create_daily_reports(
-        self, branch_id: int, report_date: date
-    ) -> int:
-        """Automatically create empty reports for all active coaches in a branch."""
-        coaches = await self.coach_repository.get_active_by_branch(branch_id)
-        created_count = 0
+    async def incomplete_reports(
+        self, report_date: date, branch_id: int | None = None
+    ) -> Sequence[DailyReport]:
+        return await self.repository.get_incomplete_for_date(report_date, branch_id)
 
-        for coach in coaches:
-            existing = await self.repository.get_by_coach_and_date(coach.id, report_date)
-            if not existing:
-                report = DailyReport(
-                    coach_id=coach.id,
-                    branch_id=branch_id,
-                    report_date=report_date,
-                    upper_uniform=UniformStatus.NO_DATA,
-                    lower_uniform=UniformStatus.NO_DATA,
-                    attendance=AttendanceStatus.NOT_FILLED,
-                    worked_hours=0,
-                    is_completed=False,
-                )
-                self.session.add(report)
-                created_count += 1
-
-        if created_count > 0:
-            await self.session.commit()
-            logger.info(f"Auto-created {created_count} daily reports for {report_date}")
-
-        return created_count
-
-    async def get_completion_stats(self, branch_id: int, report_date: date) -> dict:
-        """Get completion statistics for a branch on a date."""
-        all_coaches = await self.coach_repository.get_active_by_branch(branch_id)
-        all_reports = await self.repository.get_by_branch_and_date(branch_id, report_date)
-
-        completed_count = sum(1 for r in all_reports if r.is_completed)
-        total_count = len(all_coaches)
-
-        return {
-            "total": total_count,
-            "completed": completed_count,
-            "incomplete": total_count - completed_count,
-            "percentage": (
-                (completed_count / total_count * 100) if total_count > 0 else 0
-            ),
-        }
-
-    async def get_incomplete_reports(
-        self, branch_id: int, report_date: date
-    ) -> list[DailyReport]:
-        """Get incomplete reports for a branch on a date."""
-        all_reports = await self.repository.get_by_branch_and_date(branch_id, report_date)
-        return [r for r in all_reports if not r.is_completed]
-
-    async def get_monthly_stats(
+    async def monthly_reports(
         self, coach_id: int, year: int, month: int
-    ) -> dict:
-        """Get monthly statistics for a coach."""
-        return await self.repository.get_monthly_stats(coach_id, year, month)
+    ) -> Sequence[DailyReport]:
+        return await self.repository.get_by_coach_and_month(coach_id, year, month)
+
+    # ------------------------------------------------------------- writing
+
+    async def save_report(
+        self,
+        *,
+        coach: Coach,
+        report_date: date,
+        attendance: AttendanceStatus,
+        upper_uniform: UniformStatus,
+        lower_uniform: UniformStatus,
+        start_time: time | None,
+        end_time: time | None,
+        late_arrival_minutes: int = 0,
+        early_departure_minutes: int = 0,
+        notes: str | None = None,
+        admin_comments: str | None = None,
+        actor_id: int | None = None,
+    ) -> DailyReport:
+        """Persist a completed report, deriving worked hours from the times."""
+        report = await self.get_or_create(coach, report_date)
+
+        if attendance in NON_WORKING_STATUSES:
+            # An absent coach has no hours, no lateness and no early exit,
+            # whatever was entered before the status was changed.
+            start_time = None
+            end_time = None
+            worked_hours = 0.0
+            late_arrival_minutes = 0
+            early_departure_minutes = 0
+        else:
+            worked_hours = calculate_worked_hours(start_time, end_time)
+
+        report.attendance = attendance
+        report.upper_uniform = upper_uniform
+        report.lower_uniform = lower_uniform
+        report.start_time = start_time
+        report.end_time = end_time
+        report.worked_hours = Decimal(str(worked_hours))
+        report.late_arrival_minutes = max(int(late_arrival_minutes), 0)
+        report.early_departure_minutes = max(int(early_departure_minutes), 0)
+        report.notes = notes or None
+        report.admin_comments = admin_comments or None
+        report.is_completed = True
+        report.completed_by_user_id = actor_id
+
+        await self.audit.record(
+            action="daily_report.saved",
+            entity_type="daily_report",
+            entity_id=report.id,
+            user_id=actor_id,
+            changes={
+                "coach_id": coach.id,
+                "date": report_date,
+                "attendance": attendance.value,
+                "worked_hours": worked_hours,
+            },
+        )
+        await self.session.commit()
+        logger.info(
+            "Saved report coach={} date={} hours={}", coach.id, report_date, worked_hours
+        )
+        return report
+
+    async def ensure_day_exists(self, report_date: date) -> int:
+        """Create placeholder reports for a date. Idempotent."""
+        created = await self.repository.ensure_reports_exist(report_date)
+        if created:
+            logger.info("Created {} placeholder reports for {}", created, report_date)
+        return created
+
+    # --------------------------------------------------------- aggregation
+
+    async def monthly_stats(self, coach_id: int, year: int, month: int) -> MonthlyStats:
+        return await self.repository.monthly_stats(coach_id, year, month)
+
+    async def completion(
+        self, start: date, end: date, branch_id: int | None = None
+    ) -> CompletionStats:
+        return await self.repository.completion_stats(start, end, branch_id)

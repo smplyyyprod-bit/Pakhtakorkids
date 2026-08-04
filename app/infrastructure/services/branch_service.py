@@ -1,73 +1,106 @@
-from typing import Optional
+"""Branch management."""
+
+from typing import Sequence
 
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.logger import get_logger
 from app.domain.models import Branch
-from app.infrastructure.repositories import BranchRepository
+from app.infrastructure.repositories import BranchRepository, CoachRepository
+from app.infrastructure.services.audit_service import AuditService
 
 logger = get_logger()
 
 
 class BranchService:
-    """Service for branch operations."""
-
-    def __init__(self, session: AsyncSession):
+    def __init__(self, session: AsyncSession) -> None:
         self.session = session
         self.repository = BranchRepository(session)
+        self.coaches = CoachRepository(session)
+        self.audit = AuditService(session)
 
-    async def create_branch(self, name: str, description: str = "", address: str = "") -> Branch:
-        """Create a new branch."""
-        logger.info(f"Creating branch: {name}")
-        branch = Branch(
-            name=name,
-            description=description,
-            address=address,
-            is_active=True,
-        )
-        return await self.repository.create(branch)
+    async def list_branches(self) -> Sequence[Branch]:
+        return await self.repository.list_active()
 
-    async def get_branch(self, branch_id: int) -> Optional[Branch]:
-        """Get branch by ID."""
+    async def get_branch(self, branch_id: int) -> Branch | None:
         return await self.repository.get_by_id(branch_id)
 
-    async def get_branch_by_name(self, name: str) -> Optional[Branch]:
-        """Get branch by name."""
-        return await self.repository.get_by_name(name)
-
-    async def get_all_branches(self) -> list[Branch]:
-        """Get all branches."""
-        return await self.repository.get_active_branches()
-
-    async def get_branch_with_coaches(self, branch_id: int) -> Optional[Branch]:
-        """Get branch with all coaches."""
-        return await self.repository.get_with_coaches(branch_id)
+    async def create_branch(
+        self,
+        *,
+        name: str,
+        description: str = "",
+        address: str = "",
+        actor_id: int | None = None,
+    ) -> Branch:
+        branch = Branch(
+            name=name,
+            description=description or None,
+            address=address or None,
+            is_active=True,
+        )
+        await self.repository.add(branch)
+        await self.audit.record(
+            action="branch.created",
+            entity_type="branch",
+            entity_id=branch.id,
+            user_id=actor_id,
+            changes={"name": name},
+        )
+        await self.session.commit()
+        return branch
 
     async def update_branch(
-        self, branch_id: int, name: str = None, description: str = None, address: str = None
-    ) -> Optional[Branch]:
-        """Update branch information."""
+        self,
+        branch_id: int,
+        *,
+        name: str | None = None,
+        description: str | None = None,
+        address: str | None = None,
+        actor_id: int | None = None,
+    ) -> Branch | None:
         branch = await self.repository.get_by_id(branch_id)
-        if branch:
-            if name:
-                branch.name = name
-            if description is not None:
-                branch.description = description
-            if address is not None:
-                branch.address = address
-            logger.info(f"Updating branch: {branch_id}")
-            return await self.repository.update(branch)
-        return None
+        if branch is None:
+            return None
 
-    async def deactivate_branch(self, branch_id: int) -> Optional[Branch]:
-        """Deactivate a branch."""
+        changes: dict[str, object] = {}
+        if name is not None:
+            changes["name"] = {"from": branch.name, "to": name}
+            branch.name = name
+        if description is not None:
+            branch.description = description
+            changes["description"] = description
+        if address is not None:
+            branch.address = address
+            changes["address"] = address
+
+        await self.audit.record(
+            action="branch.updated",
+            entity_type="branch",
+            entity_id=branch.id,
+            user_id=actor_id,
+            changes=changes,
+        )
+        await self.session.commit()
+        return branch
+
+    async def set_active(
+        self, branch_id: int, active: bool, actor_id: int | None = None
+    ) -> Branch | None:
+        """Deactivate rather than delete.
+
+        Branches are referenced by historical daily reports; removing the row
+        would take the history with it.
+        """
         branch = await self.repository.get_by_id(branch_id)
-        if branch:
-            branch.is_active = False
-            logger.info(f"Deactivating branch: {branch_id}")
-            return await self.repository.update(branch)
-        return None
-
-    async def count_branches(self) -> int:
-        """Count total branches."""
-        return await self.repository.count()
+        if branch is None:
+            return None
+        branch.is_active = active
+        await self.audit.record(
+            action="branch.activated" if active else "branch.deactivated",
+            entity_type="branch",
+            entity_id=branch.id,
+            user_id=actor_id,
+        )
+        await self.session.commit()
+        return branch

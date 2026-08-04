@@ -1,39 +1,62 @@
-"""Alembic environment configuration."""
+"""Alembic environment.
+
+Migrations run through the synchronous psycopg2 driver even though the app uses
+asyncpg - Alembic's autogenerate and DDL are synchronous, and mixing the two
+drivers here only adds an event loop for no benefit.
+"""
 
 from logging.config import fileConfig
-from sqlalchemy import engine_from_config
-from sqlalchemy import pool
+
+from sqlalchemy import engine_from_config, pool
+
 from alembic import context
-import asyncio
-from app.domain.models import Base
 from app.core.config import get_settings
 
+# Import every model module so Base.metadata is fully populated before
+# autogenerate compares it against the database.
+from app.domain.models import Base  # noqa: F401
+from app.domain.models import (  # noqa: F401
+    AuditLog,
+    Branch,
+    Coach,
+    CriterionValue,
+    DailyReport,
+    EvaluationCriteria,
+    User,
+)
+
 config = context.config
-fileConfig(config.config_file_name)
+
+if config.config_file_name is not None:
+    fileConfig(config.config_file_name)
+
 target_metadata = Base.metadata
 settings = get_settings()
 
 
+def _database_url() -> str:
+    return settings.sync_database_url
+
+
 def run_migrations_offline() -> None:
-    """Run migrations in 'offline' mode."""
-    url = settings.database_url.replace("postgresql://", "postgresql+asyncpg://")
+    """Emit SQL to stdout without connecting."""
     context.configure(
-        url=url,
+        url=_database_url(),
         target_metadata=target_metadata,
         literal_binds=True,
         dialect_opts={"paramstyle": "named"},
+        compare_type=True,
+        compare_server_default=True,
     )
-
     with context.begin_transaction():
         context.run_migrations()
 
 
 def run_migrations_online() -> None:
-    """Run migrations in 'online' mode."""
-    configuration = config.get_section(config.config_ini_section)
-    configuration["sqlalchemy.url"] = settings.database_url.replace(
-        "postgresql://", "postgresql+asyncpg://"
-    )
+    """Run migrations against a live connection."""
+    configuration = config.get_section(config.config_ini_section) or {}
+    configuration["sqlalchemy.url"] = _database_url()
+
     connectable = engine_from_config(
         configuration,
         prefix="sqlalchemy.",
@@ -41,8 +64,12 @@ def run_migrations_online() -> None:
     )
 
     with connectable.connect() as connection:
-        context.configure(connection=connection, target_metadata=target_metadata)
-
+        context.configure(
+            connection=connection,
+            target_metadata=target_metadata,
+            compare_type=True,
+            compare_server_default=True,
+        )
         with context.begin_transaction():
             context.run_migrations()
 
